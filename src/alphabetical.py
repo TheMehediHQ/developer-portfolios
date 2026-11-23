@@ -22,8 +22,11 @@ def convert_to_title_case(readme_text):
             if stripped.lower() == "aaa":
                 # drop standalone 'Aaa' token
                 continue
-            if re.fullmatch(r"(?i)[A-Za-z]", stripped):
-                # drop standalone single-letter tokens (e.g. 'A', 'B', 'x')
+            # Only drop a standalone single-letter token when it leads the name
+            # (e.g. a stray "A John Doe" typo). A single letter elsewhere is
+            # commonly a real middle/last initial (e.g. "Ravi K Gupta") and must
+            # be preserved.
+            if not cleaned_tokens and re.fullmatch(r"(?i)[A-Za-z]", stripped):
                 continue
             cleaned_tokens.append(stripped)
         if not cleaned_tokens:
@@ -82,6 +85,141 @@ def find_duplicate_lines(lines, ignore_case=False, ignore_trailing_whitespace=Tr
     # Build duplicates keyed by representative original line text
     duplicates = {representative[k]: v for k, v in positions.items() if len(v) > 1}
     return duplicates
+
+
+def validate_section_placement(lines):
+    """
+    Validate that all entries are in the correct alphabetical section.
+    Move any misplaced entries to their correct sections.
+    Returns (corrected_lines, moved_count).
+    """
+    import unicodedata
+
+    header_pattern = re.compile(r"^##\s+([A-Z])$")
+    link_pattern = re.compile(r"^-\s+\[([^]]+)\]")
+
+    # Build a structure: {section_letter: {'lines': [], 'entries': []}}
+    sections_order = []
+    sections = {}
+    current_section = None
+    preamble = []
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        header_match = header_pattern.match(line.rstrip())
+
+        if header_match:
+            section_letter = header_match.group(1)
+            current_section = section_letter
+            if section_letter not in sections:
+                sections[section_letter] = {'header': line, 'before': [], 'entries': [], 'after': []}
+                sections_order.append(section_letter)
+            i += 1
+        elif current_section is None:
+            # Before any section headers
+            preamble.append(line)
+            i += 1
+        elif current_section and line.startswith("- "):
+            # This is an entry
+            sections[current_section]['entries'].append(line)
+            i += 1
+        else:
+            # Other lines (empty lines, etc.) - track whether before or after entries
+            if current_section:
+                if not sections[current_section]['entries']:
+                    sections[current_section]['before'].append(line)
+                else:
+                    sections[current_section]['after'].append(line)
+            i += 1
+
+    # Now validate and move entries
+    moved_count = 0
+    for section_letter in list(sections_order):  # Use list() to avoid modification during iteration
+        section = sections[section_letter]
+        correct_entries = []
+
+        for entry in section['entries']:
+            link_match = link_pattern.match(entry)
+            if link_match:
+                name = link_match.group(1).strip()
+                if not name:
+                    correct_entries.append(entry)
+                    continue
+
+                # Get the first character
+                first_char = name[0].upper()
+
+                # Normalize accented characters (e.g., 'É' -> 'E', 'Ö' -> 'O')
+                try:
+                    normalized = unicodedata.normalize('NFD', first_char)
+                    base_char = normalized[0] if normalized else first_char
+                except Exception:
+                    base_char = first_char
+
+                # If not a letter A-Z, keep in current section
+                if not base_char.isalpha() or not base_char.isupper():
+                    correct_entries.append(entry)
+                    continue
+
+                # Check if in correct section
+                if base_char == section_letter:
+                    correct_entries.append(entry)
+                else:
+                    # Need to move this entry
+                    moved_count += 1
+
+                    # Add to correct section
+                    if base_char in sections:
+                        sections[base_char]['entries'].append(entry)
+                    else:
+                        # Create new section
+                        sections[base_char] = {
+                            'header': f"## {base_char}\n",
+                            'before': ['\n'],
+                            'entries': [entry],
+                            'after': []
+                        }
+                        # Insert in alphabetical order
+                        insert_idx = 0
+                        for idx, letter in enumerate(sections_order):
+                            if letter < base_char:
+                                insert_idx = idx + 1
+                        sections_order.insert(insert_idx, base_char)
+            else:
+                # Keep entries that don't match pattern
+                correct_entries.append(entry)
+
+        # Update section with corrected entries
+        section['entries'] = correct_entries
+
+    # Rebuild the file
+    result = []
+    result.extend(preamble)
+
+    for idx, section_letter in enumerate(sections_order):
+        section = sections[section_letter]
+        
+        # Add section header
+        result.append(section['header'])
+        
+        # Add lines before entries (typically one blank line)
+        result.extend(section['before'])
+        
+        # Add entries
+        result.extend(section['entries'])
+        
+        # Add lines after entries
+        # If there are 'after' lines, use them
+        if section['after']:
+            result.extend(section['after'])
+        else:
+            # Ensure there's a blank line after the last entry if not the last section
+            # and if entries exist in this section
+            if section['entries'] and idx < len(sections_order) - 1:
+                result.append('\n')
+
+    return result, moved_count
 
 
 def sort_lists_alphabetically(lines):
@@ -454,6 +592,75 @@ def extract_portfolio_data(lines):
     return portfolios
 
 
+# A hostname: one or more dot-separated labels followed by an alphabetic
+# TLD, with an optional port. Deliberately does not accept IPv6/bracket
+# literals or userinfo ('user@host') — portfolio links don't need either,
+# and allowing them would reopen the door to markdown/angle-bracket junk.
+_HOSTNAME_RE = re.compile(
+    r'^(?=.{1,253}$)'
+    r'([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+'
+    r'[A-Za-z]{2,63}'
+    r'(:\d{1,5})?$'
+)
+
+
+def is_well_formed_url(url):
+    """Return True if `url` is a properly formed http(s) URL.
+
+    Requires an http/https scheme, a '//' authority, and a netloc that
+    parses as a real hostname. This single structural check subsumes
+    narrower cases we've hit in practice — a scheme with no '//'
+    (e.g. 'https:example.com', which leaves netloc empty) and leftover
+    markdown/angle-bracket syntax pasted into the URL slot (e.g.
+    '<[Portfolio-Link](https://example.com)>', which fails to parse a
+    scheme or netloc at all) — without needing to special-case individual
+    bad characters.
+    """
+    if re.search(r'\s', url):
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    return bool(_HOSTNAME_RE.match(parsed.netloc))
+
+
+_ESCAPED_SCHEME_RE = re.compile(r'(\]\()(https?)\\+(://)')
+
+
+def fix_escaped_url_scheme(lines):
+    """Strip stray backslashes from the scheme of entry links.
+
+    Markdown pasted from other sources often escapes the colon, producing
+    'https\\://example.com'. Returns (new_lines, fixed_count).
+    """
+    fixed = 0
+    out = []
+    for line in lines:
+        new_line, n = _ESCAPED_SCHEME_RE.subn(r'\1\2\3', line)
+        fixed += n
+        out.append(new_line)
+    return out, fixed
+
+
+def find_malformed_urls(lines):
+    """Scan portfolio entry lines for URLs that are not well-formed.
+
+    See `is_well_formed_url` for what counts as well-formed. Returns a list
+    of (line_number, name, url) tuples, 1-indexed by line.
+    """
+    pattern = re.compile(r'^-\s+\[([^\]]+)\]\(([^)]+)\)')
+    issues = []
+    for idx, line in enumerate(lines, start=1):
+        match = pattern.match(line.strip())
+        if not match:
+            continue
+        name = match.group(1).strip()
+        url = match.group(2).strip()
+        if not is_well_formed_url(url):
+            issues.append((idx, name, url))
+    return issues
+
+
 def create_feed_json(readme_path="README.md", output_path="feed.json"):
     """
     Read README.md and create/update feed.json with portfolio data.
@@ -472,6 +679,14 @@ def create_feed_json(readme_path="README.md", output_path="feed.json"):
     except Exception as e:
         print(f"Error creating feed.json: {e}")
         return 0
+
+
+# Matches "full stack" and common typos (fullstack, full-stack, fulstack,
+# fulletack, full stak, ...). The trailing \b rejects plurals such as
+# "Full Stacks" / "fullstacks", which are intentionally left unchanged.
+_FULL_STACK_RE = re.compile(
+    r"(?i)\bfu?l{1,2}[\W_]*?(?:stack|etack|stak|satck|statck|stck)\b"
+)
 
 
 def main():
@@ -505,7 +720,7 @@ def main():
         prefix, inside, suffix = m.group(1), m.group(2), m.group(3)
         # replace full-stack variants case-insensitively inside the bracket content
         # match 'full' and 'stack' as whole words allowing optional non-word or underscore separators
-        inside2 = re.sub(r"(?i)\bfull(?:[\W_]*?)stack\b", "Full Stack", inside)
+        inside2 = _FULL_STACK_RE.sub("Full Stack", inside)
         return f"{prefix}{inside2}{suffix}"
 
     # first normalize bracketed descriptions, then parenthesized descriptions
@@ -516,6 +731,11 @@ def main():
     # Matches [ spaces content spaces ] and removes the extra spaces
     bracket_padding_re = re.compile(r"\[\s+([^]]*?)\s+\]")
     cleaned_bracket_lines = [bracket_padding_re.sub(r"[\1]", line) for line in normalized_lines]
+
+    # Repair escaped URL schemes ('https\\://') before duplicate detection
+    cleaned_bracket_lines, escaped_fixed = fix_escaped_url_scheme(cleaned_bracket_lines)
+    if escaped_fixed:
+        print(f"Fixed {escaped_fixed} URL(s) with an escaped scheme in README.md.")
 
     # New: remove duplicate URLs across the document (keep first occurrence)
     url_deduped_lines, url_removed = remove_duplicate_urls(cleaned_bracket_lines)
@@ -548,8 +768,13 @@ def main():
     if duplicates_removed:
         print(f"Removed {duplicates_removed} duplicate line(s) from README.md (kept first occurrences).")
 
-    # Sort and write back (using the deduplicated list)
-    sorted_lines, header_indices = sort_lists_alphabetically(deduped_lines)
+    # NEW: Validate and reorganize sections - move misplaced entries to correct sections
+    reorganized_lines, moved_count = validate_section_placement(deduped_lines)
+    if moved_count:
+        print(f"Moved {moved_count} misplaced entr{'y' if moved_count == 1 else 'ies'} to correct alphabetical section(s).")
+
+    # Sort and write back (using the reorganized list)
+    sorted_lines, header_indices = sort_lists_alphabetically(reorganized_lines)
 
     # New: remove adjacent exact duplicates where both [text] and (link) match
     final_lines, post_removed = remove_exact_duplicate_links(sorted_lines)
@@ -564,6 +789,14 @@ def main():
     portfolio_count = create_feed_json()
     if portfolio_count:
         print(f"Created feed.json with {portfolio_count} portfolio entries.")
+
+    # Warn about malformed URLs (e.g. missing '//' after the scheme) so they
+    # can be fixed before merge instead of silently slipping through review.
+    malformed = find_malformed_urls(final_lines)
+    if malformed:
+        print(f"WARNING: found {len(malformed)} malformed URL(s):")
+        for line_no, name, url in malformed:
+            print(f"  line {line_no}: [{name}]({url})")
 
 
 if __name__ == "__main__":
